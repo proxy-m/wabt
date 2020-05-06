@@ -229,13 +229,6 @@ void BinaryWriterSpec::WriteConst(const Const& const_) {
       WriteF64(const_.f64_bits(), const_.expected_nan());
       break;
 
-    case Type::Nullref:
-      WriteString("nullref");
-      WriteSeparator();
-      WriteKey("value");
-      json_stream_->Writef("\"0\"");
-      break;
-
     case Type::Funcref: {
       WriteString("funcref");
       WriteSeparator();
@@ -245,8 +238,8 @@ void BinaryWriterSpec::WriteConst(const Const& const_) {
       break;
     }
 
-    case Type::Hostref: {
-      WriteString("hostref");
+    case Type::Externref: {
+      WriteString("externref");
       WriteSeparator();
       WriteKey("value");
       int64_t ref_bits = static_cast<int64_t>(const_.ref_bits());
