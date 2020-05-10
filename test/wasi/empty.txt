@@ -1,0 +1,3 @@
+;;; TOOL: run-interp-wasi
+(func (export "_start")
+)

@@ -22,6 +22,10 @@
 #include <string>
 #include <vector>
 
+#ifdef WITH_WASI
+#include "uvwasi.h"
+#endif
+
 #include "src/binary-reader.h"
 #include "src/error-formatter.h"
 #include "src/feature.h"
@@ -42,6 +46,9 @@ static bool s_run_all_exports;
 static bool s_host_print;
 static bool s_dummy_import_func;
 static Features s_features;
+#ifdef WITH_WASI
+static bool s_wasi;
+#endif
 
 static std::unique_ptr<FileStream> s_log_stream;
 static std::unique_ptr<FileStream> s_stdout_stream;
@@ -89,6 +96,12 @@ static void ParseOptions(int argc, char** argv) {
                    });
   parser.AddOption('t', "trace", "Trace execution",
                    []() { s_trace_stream = s_stdout_stream.get(); });
+#ifdef WITH_WASI
+  parser.AddOption("wasi",
+                   "Assume input module is WASI compliant (Export "
+                   " WASI API the the module and invoke _start function)",
+                   []() { s_wasi = true; });
+#endif
   parser.AddOption(
       "run-all-exports",
       "Run all the exported functions, in order. Useful for testing",
@@ -137,6 +150,41 @@ Result RunAllExports(const Instance::Ptr& instance, Errors* errors) {
   return result;
 }
 
+#ifdef WITH_WASI
+Result RunWasiStart(const Instance::Ptr& instance, Errors* errors) {
+  auto* stream = s_stdout_stream.get();
+
+  auto module = s_store.UnsafeGet<Module>(instance->module());
+  auto&& module_desc = module->desc();
+  for (auto&& export_ : module_desc.exports) {
+    if (export_.type.name != "_start") {
+      continue;
+    }
+    if (export_.type.type->kind != ExternalKind::Func) {
+      stream->Writef("wasi error: _start export is not a function\n");
+      return Result::Error;
+    }
+    auto* func_type = cast<FuncType>(export_.type.type.get());
+    if (func_type->params.size() || func_type->results.size()) {
+      stream->Writef("wasi error: invalid _start signature\n");
+      return Result::Error;
+    }
+    Values params;
+    Values results;
+    Trap::Ptr trap;
+    auto func = s_store.UnsafeGet<Func>(instance->funcs()[export_.index]);
+    Result res = func->Call(s_store, params, results, &trap, s_trace_stream);
+    if (trap) {
+      WriteTrap(stream, " error", trap);
+    }
+    return res;
+  }
+
+  stream->Writef("wasi error: _start function not found\n");
+  return Result::Error;
+}
+#endif
+
 Result ReadAndInstantiateModule(const char* module_filename,
                                 Errors* errors,
                                 Instance::Ptr* out_instance) {
@@ -159,27 +207,82 @@ Result ReadAndInstantiateModule(const char* module_filename,
 
   auto module = Module::New(s_store, module_desc);
 
+#ifdef WITH_WASI
+  uvwasi_t uvwasi;
+  uvwasi_t* uvwasi_ptr = &uvwasi;
+
+  if (s_wasi) {
+    uvwasi_errno_t err;
+    uvwasi_options_t init_options;
+    /* Setup the initialization options. */
+    init_options.in = 0;
+    init_options.out = 1;
+    init_options.err = 2;
+    init_options.fd_table_size = 3;
+    init_options.argc = 0;
+    init_options.argv = NULL;
+    init_options.envp = NULL;
+    init_options.preopenc = 0;
+    init_options.preopens = NULL;
+    init_options.allocator = NULL;
+
+    err = uvwasi_init(uvwasi_ptr, &init_options);
+    if (err != UVWASI_ESUCCESS) {
+      stream->Writef("error initialiazing uvwasi: %d\n", err);
+      return Result::Error;
+    }
+  }
+#endif
+
   RefVec imports;
   for (auto&& import : module_desc.imports) {
-    if (import.type.type->kind == ExternKind::Func &&
-        ((s_host_print && import.type.module == "host" &&
-          import.type.name == "print") ||
-         s_dummy_import_func)) {
-      auto func_type = *cast<FuncType>(import.type.type.get());
-      auto import_name = StringPrintf("%s.%s", import.type.module.c_str(),
-                                      import.type.name.c_str());
+    if (import.type.type->kind == ExternKind::Func) {
+#ifdef WITH_WASI
+      if (s_wasi && import.type.module == "wasi_snapshot_preview1") {
+        auto func_type = *cast<FuncType>(import.type.type.get());
+        auto import_name = StringPrintf("%s.%s", import.type.module.c_str(),
+                                        import.type.name.c_str());
+        HostFunc::Ptr host_func;
+        if (import.type.name == "proc_exit") {
+          host_func = HostFunc::New(
+              s_store, func_type,
+              [=](const Values& params, Values& results,
+                  Trap::Ptr* trap) -> Result {
+                if (s_trace_stream) {
+                  s_trace_stream->Writef(">>> running wasi function \"%s\":\n",
+                                         import.type.name.c_str());
+                }
+                const Value return_code = params[0];
+                uvwasi_proc_exit(uvwasi_ptr, return_code.i32_);
+                return Result::Ok;
+              });
+        } else {
+          stream->Writef("unknown wasi_snapshot_preview1 import: %s\n",
+                         import.type.name.c_str());
+          return Result::Error;
+        }
+        imports.push_back(host_func.ref());
+        continue;
+      }
+#endif
+      if (((s_host_print && import.type.module == "host" &&
+            import.type.name == "print") ||
+           s_dummy_import_func)) {
+        auto func_type = *cast<FuncType>(import.type.type.get());
+        auto import_name = StringPrintf("%s.%s", import.type.module.c_str(),
+                                        import.type.name.c_str());
 
-      auto host_func =
-          HostFunc::New(s_store, func_type,
-                        [=](const Values& params, Values& results,
-                            Trap::Ptr* trap) -> Result {
-                          printf("called host ");
-                          WriteCall(stream, import_name, func_type, params,
-                                    results, *trap);
-                          return Result::Ok;
-                        });
-      imports.push_back(host_func.ref());
-      continue;
+        auto host_func = HostFunc::New(
+            s_store, func_type,
+            [=](const Values& params, Values& results,
+                Trap::Ptr* trap) -> Result {
+              printf("called host ");
+              WriteCall(stream, import_name, func_type, params, results, *trap);
+              return Result::Ok;
+            });
+        imports.push_back(host_func.ref());
+        continue;
+      }
     }
 
     // By default, just push an null reference. This won't resolve, and
@@ -202,8 +305,15 @@ static Result ReadAndRunModule(const char* module_filename) {
   Errors errors;
   Instance::Ptr instance;
   Result result = ReadAndInstantiateModule(module_filename, &errors, &instance);
-  if (Succeeded(result) && s_run_all_exports) {
-    RunAllExports(instance, &errors);
+  if (Succeeded(result)) {
+    if (s_run_all_exports) {
+      RunAllExports(instance, &errors);
+    }
+#ifdef WITH_WASI
+    if (s_wasi) {
+      RunWasiStart(instance, &errors);
+    }
+#endif
   }
   FormatErrorsToFile(errors, Location::Type::Binary);
   return result;

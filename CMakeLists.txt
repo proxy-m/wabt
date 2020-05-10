@@ -46,6 +46,8 @@ option(USE_UBSAN "Use undefined behavior sanitizer" OFF)
 option(CODE_COVERAGE "Build with code coverage enabled" OFF)
 option(WITH_EXCEPTIONS "Build with exceptions enabled" OFF)
 option(WERROR "Build with warnings as errors" OFF)
+# wasi support is still experimental
+option(WITH_WASI "Build WASI support via uvwasi" OFF)
 
 if (MSVC)
   set(COMPILER_IS_CLANG 0)
@@ -419,10 +421,19 @@ if (NOT EMSCRIPTEN)
       INSTALL
     )
 
+    if(WITH_WASI)
+      add_subdirectory("third_party/uvwasi" EXCLUDE_FROM_ALL)
+      include_directories("${libuv_SOURCE_DIR}/include")
+      include_directories(third_party/uvwasi/include)
+      add_definitions(-DWITH_WASI)
+      set(INTERP_LIBS uvwasi_a)
+    endif()
+
     # wasm-interp
     wabt_executable(
       NAME wasm-interp
       SOURCES src/tools/wasm-interp.cc
+      LIBS ${INTERP_LIBS}
       WITH_LIBM
       INSTALL
     )
