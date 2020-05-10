@@ -432,7 +432,7 @@ if (NOT EMSCRIPTEN)
     # wasm-interp
     wabt_executable(
       NAME wasm-interp
-      SOURCES src/tools/wasm-interp.cc
+      SOURCES src/tools/wasm-interp.cc src/interp/interp-wasi.cc
       LIBS ${INTERP_LIBS}
       WITH_LIBM
       INSTALL
